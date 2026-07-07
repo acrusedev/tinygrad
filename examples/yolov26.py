@@ -1,18 +1,18 @@
 import json
 import sys
-import cv2
 import math
 import copy
+import time
+import cv2
 import numpy as np
-from time import time
 from itertools import chain
 from pathlib import Path
 from collections import defaultdict
 
 from tinygrad import Tensor
+from tinygrad.helpers import fetch, make_tuple
 from tinygrad.nn import Conv2d, BatchNorm2d
 from tinygrad.nn.state import load_state_dict, safe_load
-from tinygrad.helpers import fetch, make_tuple
 
 def compute_transform(image:np.ndarray,new_shape=(640,640),auto=False,scaleFill=False,scaleUp=True,stride=32):
   shape = image.shape[:2] # current shape [height, width]
@@ -83,7 +83,7 @@ class Bottleneck:
 class C3K:
   def __init__(self,c1:int,c2:int,n:int=1,shortcut:bool=True,g:int=1,e:float=0.5,k:int|tuple[int, int]=3):
     c_=int(c2*e)
-    k=make_tuple(k,2) if isinstance(k,int) else k
+    k=make_tuple(k,2) if isinstance(k,int) else k # type: ignore
     self.cv1=Conv(c1,c_,1,1)
     self.cv2=Conv(c1,c_,1,1)
     self.cv3=Conv(2*c_,c2,1,1)
@@ -110,18 +110,6 @@ class C2F:
 
 class C3K2(C2F):
   def __init__(self,c1:int,c2:int,n:int=1,c3k:bool=False,e:float=0.5,g:int=1,shortcut:bool=True,k:int|tuple=3,attn=False):
-    """
-      Initialize C3k2 module.
-
-      Args:
-        c1 (int): Input channels.
-        c2 (int): Output channels.
-        n (int): Number of blocks.
-        c3k (bool): Whether to use C3k blocks.
-        e (float): Expansion ratio.
-        g (int): Groups for convolutions.
-        shortcut (bool): Whether to use shortcut connections.
-    """
     super().__init__(c1,c2,n,shortcut,g,e)
     k=make_tuple(k,2) if isinstance(k,int) else k
     self.m = [
@@ -151,11 +139,11 @@ class C3K2(C2F):
 class MaxPool2d:
   def __init__(self, kernel_size:int|tuple[int, int], stride:int|tuple[int, int]|None=None, padding:int|tuple[int, ...]=0, dilation:int|tuple[int, int]=1):
     self.kernel_size, self.stride, self.padding, self.dilation = kernel_size, stride, padding, dilation
-
   def __call__(self, x:Tensor)->Tensor:
     return x.max_pool2d(self.kernel_size, self.stride, self.dilation, self.padding)
 
 class SPPF:
+  # from https://github.com/ultralytics/ultralytics/blob/main/ultralytics/nn/modules/block.py
   def __init__(self, c1:int, c2:int, k:int=5, n:int=3, shortcut:bool=True):
     c_ = c1 // 2
     self.cv1 = Conv(c1, c_, 1, 1, act=False)
@@ -171,6 +159,7 @@ class SPPF:
     return x + y if self.add else y
 
 class Attention:
+  # from https://github.com/ultralytics/ultralytics/blob/main/ultralytics/nn/modules/block.py
   def __init__(self, dim:int, num_heads:int=8, attn_ratio:float=0.5):
     self.num_heads = num_heads
     self.head_dim = dim // num_heads
@@ -192,6 +181,7 @@ class Attention:
     return self.proj(x)
 
 class PSABlock:
+  # from https://github.com/ultralytics/ultralytics/blob/main/ultralytics/nn/modules/block.py
   def __init__(self, c:int, attn_ratio:float=0.5, num_heads:int=4, shortcut:bool=True):
     self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads)
     self.ffn = [Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False)]
@@ -205,6 +195,7 @@ class PSABlock:
     return x + y if self.add else y
 
 class C2PSA:
+  # from https://github.com/ultralytics/ultralytics/blob/main/ultralytics/nn/modules/block.py
   def __init__(self, c1, c2, n=1, e=0.5):
     assert c1 == c2
     self.c = int(c1 * e)
@@ -278,6 +269,7 @@ class Identity:
   def __call__(self, x): return x
 
 class DetectionHead:
+  # from https://github.com/ultralytics/ultralytics/blob/main/ultralytics/nn/modules/head.py
   dynamic = False  # force grid reconstruction
   export = False  # export mode
   format = None  # export format
@@ -288,12 +280,11 @@ class DetectionHead:
   strides = Tensor.empty(0)  # init
   xyxy = False  # xyxy or xywh output
 
-
   def __init__(self, nc=80, reg_max:int=16, end2end=False, ch=()):
     self.nc = nc  # number of classes
     self.nl = len(ch)
     self.reg_max = reg_max
-    self.no = nc + self.reg_max * 4  #
+    self.no = nc + self.reg_max * 4
     self.end2end = end2end
     self.stride = (8,16,32)
     c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100)) # channels
@@ -348,7 +339,7 @@ class DetectionHead:
     # otherwise use min(max_det, anchors) for safety with small inputs during Python inference
     k = max_det if self.export else min(max_det, anchors)
     if self.agnostic_nms:
-      scores, labels = scores.max(dim=-1, keepdim=True)
+      scores, labels = scores.max(axis=-1, keepdim=True)
       scores, indices = scores.topk(k, dim=1)
       labels = labels.gather(1, indices)
       return scores, labels, indices
@@ -405,10 +396,8 @@ class Concat:
 
 class Sequential(list):
   __slots__ = ()
-
   def __init__(self, *layers):
     super().__init__(layers)
-
   def __call__(self, x):
     for layer in self:
       x = layer(x)
@@ -444,24 +433,15 @@ class YOLOv26:
       C3K2(c1=c512 + c1024, c2=c1024, n=depth_scale(1, d), c3k=True, e=0.5, shortcut=True, k=3, attn=True),
       DetectionHead(num_classes, reg_max=1, end2end=True, ch=(c256, c512, c1024))
     ]
-
-
   def __call__(self, x: Tensor)->Tensor:
     outputs = []
     for i, layer in enumerate(self.model):
-      if i == 12:
-        x = layer([outputs[-1], outputs[6]])
-      elif i == 15:
-        x = layer([outputs[-1], outputs[4]])
-      elif i == 18:
-        x = layer([outputs[-1], outputs[13]])
-      elif i == 21:
-        x = layer([outputs[-1], outputs[10]])
-      elif i == 23:
-        x = layer([outputs[16], outputs[19], outputs[22]])
-      else:
-        x = layer(x)
-      
+      if i == 12: x = layer([outputs[-1], outputs[6]])
+      elif i == 15: x = layer([outputs[-1], outputs[4]])
+      elif i == 18: x = layer([outputs[-1], outputs[13]])
+      elif i == 21: x = layer([outputs[-1], outputs[10]])
+      elif i == 23: x = layer([outputs[16], outputs[19], outputs[22]])
+      else: x = layer(x)
       outputs.append(x)
     return x
 
@@ -560,12 +540,12 @@ if __name__=="__main__":
   yolo_infer = YOLOv26(w=width, d=depth, ch=max_channels, num_classes=80)
   state_dict = safe_load(get_weights_location(yolo_variant))
   load_state_dict(yolo_infer, state_dict)
-  st = time()
+  st = time.monotonic()
   print(f"runnning inference")
   predictions = yolo_infer(preprocessed_image)
   predictions = predictions.numpy()[0]
   predictions = predictions[predictions[:,4] > conf_thres]
-  print(f'did inference in {int(round(((time() - st) * 1000)))}ms')
+  print(f'did inference in {int(round(((time.monotonic() - st) * 1000)))}ms')
   print(f"predictions {predictions}")
   class_labels = fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names').read_text().split("\n")
   print(f"detections after confidence filter: {len(predictions)}")
