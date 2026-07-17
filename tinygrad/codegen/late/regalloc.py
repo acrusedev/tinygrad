@@ -49,9 +49,8 @@ class LinearScanRegallocContext:
     # assign register to spilled virtual and record load to be emitted before current uop, also assign it a stack slot
     def fill(v:Register, i:int, cons:tuple[Register, ...]|None=None) -> Register:
       if v not in self.spills:
-        # the value of a BUFFER is its 64bit address
-        dt = self.vdef(v).dtype
-        sz = 8 if self.vdef(v).op is Ops.BUFFER else dt.itemsize
+        # the value of a BUFFER is its 64bit address, XMM registers need 16 bytes
+        sz = 16 if v.cons[0].size == 16 else (8 if self.vdef(v).op is Ops.BUFFER else self.vdef(v).dtype.itemsize)
         offset = self.stack_size + (sz - self.stack_size % sz) % sz
         self.spills[v] = UOp.const(dtypes.int32, offset)
         self.stack_size = offset + sz
@@ -127,8 +126,8 @@ def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
   if ctx.stack_size > 0:
     sp = ctx.ren.stack_pointer()
     offset = UOp(Ops.CONST, sp.dtype, arg=ctx.stack_size)
-    if i == 0: before = [ctx.ren.isel_matcher.rewrite(UOp(Ops.SUB, sp.dtype, (sp, offset), tag=sp.tag))] + before
-    elif i == len(ctx.uops) - 2: before += [ctx.ren.isel_matcher.rewrite(UOp(Ops.ADD, sp.dtype, (sp, offset), tag=sp.tag))]
+    if i == 0: before = [ctx.ren.isel_matcher.rewrite(UOp(Ops.SUB, src=(sp, offset), tag=sp.tag))] + before
+    elif i == len(ctx.uops) - 2: before += [ctx.ren.isel_matcher.rewrite(UOp(Ops.ADD, src=(sp, offset), tag=sp.tag))]
 
   return nx, before + [nx] + after
 

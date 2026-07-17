@@ -38,8 +38,9 @@ pm_number_params = PatternMatcher([
   (UPat(Ops.PARAM, name="x"), do_number_param),
 ])
 
-pm_no_weakints = PatternMatcher([
-  (UPat(GroupOp.All, dtype=dtypes.weakint, name="x"), lambda x: x.replace(dtype=dtypes.int))
+pm_no_index = PatternMatcher([
+  (UPat(GroupOp.ALU.union({Ops.CONST}), dtype=dtypes.index, name="x"), lambda x: x.replace(dtype=dtypes.int)),
+  (UPat(Ops.CAST, dtype=dtypes.index, src=(UPat.var("x"),)), lambda x: x.cast(dtypes.int)),
 ])
 
 def build_range_map(sink:UOp) -> dict[int, int]:
@@ -78,9 +79,10 @@ def unroll_axis(ctx:dict[int, int], u:UOp, arg):
   return out.permute(argsort(permute_head+permute_tail))
 
 def expand_wmma(ctx:dict[int, int], u:UOp):
-  if u.tag != 1: return None
-  in0, in1, out0 = u.arg[6]
-  wmma = u.replace(src=(contract_axis(ctx, u.src[0], in0), contract_axis(ctx, u.src[1], in1), u.src[2]), tag=None)
+  if u.arg[4] is None: return None
+  in0, in1, out0 = u.arg[4]
+  wmma = u.replace(src=(contract_axis(ctx, u.src[0], in0), contract_axis(ctx, u.src[1], in1), u.src[2]),
+                   arg=(*u.arg[:4], None))
   return unroll_axis(ctx, wmma, out0)
 
 expander2 = PatternMatcher([
@@ -108,13 +110,13 @@ def broadcast_and_devec_wmma(b:UOp):
                   for u,shp in zip(b.src, shaped_aligned)]
   src = []
   for idx in itertools.product(*[range(i) for i in b.shape[:-1]]):
-    idx_c = [UOp.const(dtypes.weakint, i) for i in idx]
+    idx_c = [UOp.const(dtypes.index, i) for i in idx]
     src.append(b.replace(src=tuple([x.index(*idx_c) for x in src_reshaped])))
-  return UOp.vectorize(*src).reshape(b.shape)
+  return UOp.stack(*src).reshape(b.shape)
 
 pm_wmma_add = PatternMatcher([
   (UPat(Ops.WMMA, name="wmma") + UPat.var("add"),
-   lambda add, wmma: UOp(wmma.op, wmma.dtype, (wmma.src[0], wmma.src[1], wmma.src[2]+add), wmma.arg)),
+   lambda add, wmma: UOp(wmma.op, src=(wmma.src[0], wmma.src[1], wmma.src[2]+add), arg=wmma.arg)),
   # push permute/reshape to the other side of the add
   (UPat(Ops.PERMUTE, src=(UPat(Ops.WMMA, name="wmma"),), name="permute") + UPat.var("add"),
     lambda wmma,permute,add: (wmma + add.permute(argsort(permute.arg))).permute(permute.arg)),
@@ -133,9 +135,9 @@ def do_devectorize(b:UOp):
   if not all_same([x.shape for x in b.src]): return None
   src = []
   for idx in itertools.product(*[range(x) for x in b.shape]):
-    idx_c = [UOp.const(dtypes.weakint, i) for i in idx]
+    idx_c = [UOp.const(dtypes.index, i) for i in idx]
     src.append(b.replace(src=tuple([x.index(*idx_c) for x in b.src])))
-  return UOp.vectorize(*src).reshape(b.shape) if b.op is not Ops.STORE else UOp.group(*src)
+  return UOp.stack(*src).reshape(b.shape) if b.op is not Ops.STORE else UOp.group(*src)
 
 def do_stack_wmma(u:UOp):
   if all(x.op in (Ops.STACK, Ops.WMMA) for x in u.src): return None
@@ -143,7 +145,7 @@ def do_stack_wmma(u:UOp):
   src = []
   for b in u.src:
     if b.op != Ops.STACK:
-      src.append(UOp._stack(*[b.index(UOp.const(dtypes.weakint, i)) for i in range(b.max_numel())]))
+      src.append(UOp.stack(*[b.index(UOp.const(dtypes.index, i)) for i in range(b.max_numel())]))
     else:
       src.append(b)
   return u.replace(src=tuple(src))
@@ -162,17 +164,17 @@ devectorizer2 = mop_cleanup+pm_mops+PatternMatcher([
   (UPat(Ops.WMMA, name="u"), do_stack_wmma),
   # stacked INDEX is many INDEX
   (UPat(Ops.INDEX, src=(UPat((Ops.PARAM, Ops.BUFFER), name="b"), UPat(Ops.STACK, name="s"))),
-   lambda b,s: UOp.vectorize(*[b.index(u) for u in s.src])),
+   lambda b,s: UOp.stack(*[b.index(u) for u in s.src])),
   # INDEX into RESHAPE moves the RESHAPE
   (UPat(Ops.INDEX, src=(UPat((Ops.PARAM, Ops.BUFFER), name="b"), UPat(Ops.RESHAPE, name="s"))),
    lambda b,s: b.index(s.src[0]).reshape(s.shape)),
   # RESHAPE a void is removed (hack for AFTER)
   (UPat(Ops.RESHAPE, dtype=dtypes.void, name="x"), lambda x: x.src[0]),
   # reshape of a single element shaped value to scalar is an index
-  (UPat(Ops.RESHAPE, name="x"), lambda x: x.src[0].index(UOp.const(dtypes.weakint, 0)) if x.marg == () and x.src[0].shape == (1,) else None),
+  (UPat(Ops.RESHAPE, name="x"), lambda x: x.src[0].index(UOp.const(dtypes.index, 0)) if x.marg == () and x.src[0].shape == (1,) else None),
   # EXPAND on scalar -> STACK
   (UPat(Ops.EXPAND, src=(UPat.var("x"), UPat()), name="out"),
-   lambda x,out: UOp.vectorize(*([x]*out.max_numel())) if x.shape == () and out.shape == (out.max_numel(),) else None),
+   lambda x,out: UOp.stack(*([x]*out.max_numel())) if x.shape == () and out.shape == (out.max_numel(),) else None),
   # INDEX on INDEX is INDEX
   (UPat(Ops.INDEX, src=(UPat(Ops.INDEX, name="idx1", allow_any_len=True),), allow_any_len=True, name="idx2"),
    lambda idx1, idx2: idx1.src[0].index(*idx1.src[1:], *idx2.src[1:])),
@@ -259,6 +261,13 @@ pm_add_local_buffers = PatternMatcher([
   (UPat(Ops.STAGE, name="x"), add_local_buffer),
 ])+pm_mops
 
+# float ALUs need a float operand
+# make that cast explicit before the decomps, which expand SIN/LOG2/EXP2 into float polynomials and assert a float operand
+pm_cast_float_alu = PatternMatcher([
+  (UPat((Ops.SIN, Ops.LOG2, Ops.EXP2, Ops.SQRT, Ops.RECIPROCAL), src=(UPat(name="x"),), name="u"),
+   lambda u,x: u.replace(src=(x.cast(u.dtype),)) if x.dtype != u.dtype else None),
+])
+
 def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
   if DEBUG >= 5: print(pyrender(ast))
@@ -326,10 +335,9 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # final symbolic before decomp
   sink = graph_rewrite(sink, symbolic, name="final symbolic")
 
-  # **** decomps ****
+  sink = graph_rewrite(sink, pm_cast_float_alu, name="cast float alu operands")
 
-  # optional pre matcher
-  if ren.pre_matcher is not None: sink = graph_rewrite(sink, ren.pre_matcher, name="pre_matcher")
+  # **** decomps ****
 
   # floordiv+mod / dtype decomp (early)
   supported_ops = tuple(ren.code_for_op.keys())
@@ -346,7 +354,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
 
   # final rules for the renderer (without sym)
   extra_matcher = ren.extra_matcher if ren.extra_matcher is not None else PatternMatcher([])
-  pm_final_rewrite = pm_decomp+extra_matcher+pm_split_ends+pm_no_weakints
+  pm_final_rewrite = pm_decomp+extra_matcher+pm_split_ends+pm_no_index
   sink = graph_rewrite(sink, pm_final_rewrite+pm_remove_invalid, ctx=ren, name="final rewrite")
 
   # this was the linearizer
