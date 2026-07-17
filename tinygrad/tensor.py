@@ -3,7 +3,7 @@ from __future__ import annotations
 import time, functools, sys, inspect, pathlib, hashlib, weakref
 from typing import Any, Callable, cast, get_args, ParamSpec, TypeVar, Generic, TYPE_CHECKING
 if TYPE_CHECKING: import numpy
-from tinygrad.dtype import DType, DTypeLike, dtypes, ConstType, to_dtype, _from_np_dtype, _to_np_dtype, PyConst
+from tinygrad.dtype import DType, DTypeLike, dtypes, ConstType, to_dtype, strong_dtype, _from_np_dtype, _to_np_dtype, PyConst
 from tinygrad.helpers import all_int, getenv, fully_flatten, fetch, Metadata, TRACEMETA, is_numpy_ndarray, TracingKey
 from tinygrad.helpers import cpu_profile, suppress_finalizing, disable_gc
 from tinygrad.uop.ops import UOp, Ops, sint, all_metadata, _index_to_concrete_int, Variable, _broadcast_shape
@@ -69,9 +69,8 @@ class Tensor(RandMixin):
 
     # create a UOp from the different types of inputs
     if isinstance(data, UOp):
-      assert _dtype is None or _dtype==data.dtype or data.dtype==dtypes.weakint, f"dtype mismatch: {_dtype} vs {data.dtype}"
-      # if data is dtype.weakint that means that this is a symbolic int and we need to lower it to something we can make a Tensor out of
-      if data.dtype == dtypes.weakint: data = _index_to_concrete_int(data)
+      # if data is dtype.index that means that this is a symbolic int and we need to lower it to something we can make a Tensor out of
+      if data.dtype == dtypes.index: data = _index_to_concrete_int(data)
     elif data is None:
       data = UOp.const(_dtype or dtypes.default_float, 0)
     elif isinstance(data, get_args(ConstType)):
@@ -98,6 +97,8 @@ class Tensor(RandMixin):
 
     # data might be on a different device
     self.uop:UOp = data if data.device is None or data.device == _device else data.copy_to_device(_device)
+    # cast on the target device, the source may not hold the dtype (numpy has no fp8/bfloat16) or be able to compute it (DISK)
+    if _dtype is not None and self.uop.dtype != _dtype: self.uop = self.uop.cast(_dtype)
 
     # add to all_tensors after construction succeeds
     all_tensors[weakref.ref(self)] = None
@@ -204,7 +205,7 @@ class Tensor(RandMixin):
     return self
 
   def assign(self, x:Tensor|PyConst|list|tuple) -> Tensor:
-    is_disk = isinstance(self.device, str) and self.device.startswith("DISK")
+    is_disk = isinstance(self.device, str) and self.device.startswith(("DISK", "TINYFS"))
     if not isinstance(x, Tensor): x = Tensor(x, device="CPU" if is_disk else self.device, dtype=self.dtype)
     if self.uop is x.uop: return self  # a self assign is a NOOP
     # broadcast x (shape only, dtype must match)
@@ -217,7 +218,7 @@ class Tensor(RandMixin):
 
     # TODO: this is a hack for writing to DISK. remove with working assign
     if is_disk:
-      self._buffer().copyin(x._data())
+      (b:=self._buffer()).copy_from(Buffer("PYTHON", b.size, b.dtype, opaque=x._data()))
       return self
     # STORE+AFTER: STORE is the write effect (void), AFTER wraps the view for correct shape/ranging
     assign = self.uop.after(self.uop.store(x.uop))
@@ -237,7 +238,7 @@ class Tensor(RandMixin):
     if capturing and not getenv("UNSAFE_ALLOW_JIT_BUFFER"):
       from tinygrad.engine.jit import JitError
       raise JitError("cannot access tensor data during JIT capture, the value will be baked in")
-    x = self.cast(self.dtype).contiguous()
+    x = self.cast(strong_dtype(self.dtype)).contiguous()
     if self.uop.device is None or isinstance(self.device, tuple): x = x.clone("CPU")
     return cast(Buffer, x.realize().uop.buffer).ensure_allocated()
 
@@ -254,10 +255,11 @@ class Tensor(RandMixin):
     """
     if 0 in self.shape: return memoryview(bytearray(0)).cast(self.dtype.fmt)  # type: ignore[arg-type,return-value]
     assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
-    fmt = self.dtype.fmt
-    assert fmt is not None, f"no fmt dtype for {self.dtype}"
+    buf = self._buffer()
+    fmt = buf.dtype.fmt
+    assert fmt is not None, f"no fmt dtype for {buf.dtype}"
     assert fmt != "e" or sys.version_info >= (3, 12)
-    return self._data().cast(fmt, self.shape)  # type: ignore[arg-type,return-value]
+    return buf.as_memoryview().cast(fmt, self.shape)  # type: ignore[arg-type,return-value]
 
   # NOTE: list[Any] because return type is recursive (list[list[...]] for higher dimensions)
   def tolist(self) -> PyConst|list[Any]:
@@ -276,6 +278,10 @@ class Tensor(RandMixin):
     """
     # TODO: remove half once minimum python supports it
     if self.dtype in (dtypes.half, dtypes.bfloat16, *dtypes.fp8s): return self.cast(dtypes.float32).tolist()
+    if 0 in self.shape:
+      assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
+      def _tolist(shape:tuple[int, ...]): return [_tolist(shape[1:]) for _ in range(shape[0])]
+      return _tolist(self.shape)
     return self.data().tolist()
 
   def numpy(self) -> 'numpy.ndarray':
@@ -529,7 +535,7 @@ class Tensor(RandMixin):
     ref_frames = [x.contiguous() for x in ref_frames or []]
     assert frame_pos.op is Ops.BIND, "frame_pos must be a bound Variable"
     srcs = (out:=Tensor.empty(*shape, device=self.device, dtype=self.dtype), self.contiguous(), state.contiguous(), *ref_frames)
-    fn = UOp(Ops.CUSTOM_FUNCTION, dtypes.void, src=(frame_pos.src[0], *[UOp.const(dtypes.int, s) for s in shape]), arg="encdec")
+    fn = UOp(Ops.CUSTOM_FUNCTION, src=(frame_pos.src[0], *[UOp.const(dtypes.int, s) for s in shape]), arg="encdec")
     return Tensor(out.uop.after(fn.call(*[s.uop for s in srcs], frame_pos)))
 
 P = ParamSpec("P")
