@@ -18,14 +18,23 @@ from test.backend.test_linearizer import helper_realized_ast, helper_linearizer_
 
 # NOTE: to_program always passes in Device[Device.DEFAULT].renderer explicitly for process_replay!!!
 
+def _tc_rand(*shape, dtype:DType) -> Tensor:
+  return Tensor.randint(*shape, low=dtype.min, high=dtype.max+1, dtype=dtype) if dtypes.is_int(dtype) else Tensor.rand(*shape, dtype=dtype)
+
 def run_program(prg:UOp, bufs:list[Buffer]):
   buf_uops = [UOp.new_buffer(b.device, b.size, b.dtype) for b in bufs]
   for u,b in zip(buf_uops, bufs): buffers[u] = b
   run_linear(UOp(Ops.LINEAR, src=(prg.call(*buf_uops),)))
 
+def _skip_unsupported_tc_dtypes(dtype_in:DType, dtype_out:DType):
+  supported_dtypes = Device[Device.DEFAULT].renderer.supported_dtypes()
+  if unsupported := [f"{name}={dtype}" for name,dtype in (("dtype_in", dtype_in), ("dtype_out", dtype_out)) if dtype not in supported_dtypes]:
+    raise unittest.SkipTest(f"tensor core requires unsupported renderer dtype: {', '.join(unsupported)}")
+
 def helper_tc_ensure_uops_and_opts_count(N: int, M:int, K:int, dtype_in:DType, dtype_out:DType, axis:int=0, tc_select:int=-1, tc_opt:int=0,
                                          ensure_triggered:bool=True):
-  a, b = Tensor.rand(M, K, dtype=dtype_in), Tensor.rand(K, N, dtype=dtype_in)
+  _skip_unsupported_tc_dtypes(dtype_in, dtype_out)
+  a, b = _tc_rand(M, K, dtype=dtype_in), _tc_rand(K, N, dtype=dtype_in)
   r = a.matmul(b, dtype=dtype_out)
   sched = r.schedule_linear()
   realized_ast = sched.src[-1].src[0]
@@ -44,7 +53,8 @@ def helper_tc_ensure_uops_and_opts_count(N: int, M:int, K:int, dtype_in:DType, d
     except KernelOptError: pass
 
 def helper_tc_allclose(N:int, M:int, K:int, dtype_in:DType, dtype_out:DType, axis:int=0, tc_select:int=-1, tc_opt:int=0, use_tensor_cores:int=1):
-  a, b = Tensor.rand(M, K, dtype=dtype_in), Tensor.rand(K, N, dtype=dtype_in)
+  _skip_unsupported_tc_dtypes(dtype_in, dtype_out)
+  a, b = _tc_rand(M, K, dtype=dtype_in), _tc_rand(K, N, dtype=dtype_in)
   np_a, np_b = a.numpy(), b.numpy()
   r = a.matmul(b, dtype=dtype_out)
   if dtype_in == dtypes.bfloat16: r = r.float()
@@ -57,9 +67,11 @@ def helper_tc_allclose(N:int, M:int, K:int, dtype_in:DType, dtype_out:DType, axi
   run_program(ast, bufs)
   if dtype_in == dtypes.half: tc_atol, tc_rtol = 1e-2, 1e-3
   elif dtype_in == dtypes.bfloat16: tc_atol, tc_rtol = (1e-1, 2e-2) if dtype_out == dtypes.bfloat16 else (1e-2, 1e-2)
+  elif not dtypes.is_float(dtype_in): tc_atol, tc_rtol = 0, 0
   else: tc_atol, tc_rtol = 5e-3, 1e-4
   c = bufs[0].numpy().reshape((M,N))
-  np.testing.assert_allclose(c, np_a @ np_b, atol=tc_atol, rtol=tc_rtol)
+  ref = (np_a.astype(np.int32) @ np_b.astype(np.int32)) if not dtypes.is_float(dtype_in) else (np_a @ np_b)
+  np.testing.assert_allclose(c, ref, atol=tc_atol, rtol=tc_rtol)
 
 class TestTensorCores(unittest.TestCase):
   # TODO: don't skip bf16 for real device (METAL, AMD)
@@ -69,13 +81,20 @@ class TestTensorCores(unittest.TestCase):
     for tc in Device[Device.DEFAULT].renderer.tensor_cores:
       helper_tc_allclose(tc.dims[0], tc.dims[1], tc.dims[2], tc.dtype_in, tc.dtype_out, axis=0, tc_opt=0)
 
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tensor_cores_nested_reduce(self):
+    tc = Device[Device.DEFAULT].renderer.tensor_cores[0]
+    a, b = Tensor.empty(tc.dims[1]*2, tc.dims[2], dtype=tc.dtype_in), Tensor.empty(tc.dims[2], tc.dims[0], dtype=tc.dtype_in)
+    ast = replace_opts(a.matmul(b, dtype=tc.dtype_out).sum(0).schedule_linear().src[-1].src[0], [Opt(OptOps.TC, 0, (-1, 0, 1))])
+    with self.assertRaises(KernelOptError): to_program(ast, Device[Device.DEFAULT].renderer)
+
   @Context(ALLOW_TF32=1)
   @unittest.skipIf(Device.DEFAULT == "PYTHON", "not generated on EMULATED device")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
   def test_tensor_cores_codegen(self):
     for tc in Device[Device.DEFAULT].renderer.tensor_cores:
       n, m, k = tc.dims
-      a, b = Tensor.rand(m, k, dtype=tc.dtype_in), Tensor.rand(k, n, dtype=tc.dtype_in)
+      a, b = _tc_rand(m, k, dtype=tc.dtype_in), _tc_rand(k, n, dtype=tc.dtype_in)
       r = a.matmul(b, dtype=tc.dtype_out)
       prg = to_program(replace_opts(r.schedule_linear().src[-1].src[0],
                         [Opt(op=OptOps.TC, axis=0, arg=(-1, 2, 1))]), Device[Device.DEFAULT].renderer)
@@ -136,9 +155,9 @@ class TestTensorCores(unittest.TestCase):
       if tc.dtype_in is dtypes.bfloat16: continue # <-- broken with numpy
       # this will be a M=G16, N=G32, M=G16, M=G16, K=R16, K=R16, K=R16 with 9 choices of TC MNK axes
       golden_result = None
+      a = Tensor.rand(16, 16, 29, 29, dtype=tc.dtype_in).realize()
+      b = Tensor.rand(32, 16, 16, 16, dtype=tc.dtype_in).realize()
       for axis in range(9):
-        a = Tensor.rand(16, 16, 29, 29, dtype=tc.dtype_in).realize()
-        b = Tensor.rand(32, 16, 16, 16, dtype=tc.dtype_in).realize()
         c = a.conv2d(b, padding=1, dtype=tc.dtype_out)
         realized_ast, real_bufs = helper_realized_ast(c)
 
@@ -155,7 +174,7 @@ class TestTensorCores(unittest.TestCase):
         result = np.frombuffer(real_bufs[0].as_memoryview(), _to_np_dtype(real_bufs[0].dtype))
 
         # ensure the results for each choice of axis matches
-        if golden_result is None: golden_result = np.frombuffer(real_bufs[0].as_memoryview(), _to_np_dtype(real_bufs[0].dtype))
+        if golden_result is None: golden_result = result.copy()
         np.testing.assert_allclose(result, golden_result, atol=0.1, rtol=0.2)
 
   @Context(ALLOW_TF32=1)

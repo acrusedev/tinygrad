@@ -13,6 +13,7 @@ from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.renderer.isa import ISARenderer
 from test.helpers import replace_opts
+from test.backend.test_softmax_fusion import single_kernel_softmax
 MOCKGPU = DEV.interface.startswith("MOCK")
 
 from tinygrad.uop.render import print_uops # noqa: F401 # pylint: disable=unused-import
@@ -267,9 +268,9 @@ class TestLinearizer(unittest.TestCase):
     uops = tuple(to_program(replace_opts(ast, []), renderer=Device[Device.DEFAULT].renderer).src[1].src)
     idxs = dedup([uop for uop in uops if uop.op is Ops.SPECIAL])
     idxs = sorted(idxs, key=lambda uop: uop.arg)
-    assert (idxs[0].arg, idxs[0].src[0].arg) == ('gidx0', 6), idxs[0]
-    assert (idxs[1].arg, idxs[1].src[0].arg) == ('gidx1', 5), idxs[1].arg
-    assert (idxs[2].arg, idxs[2].src[0].arg) == ('gidx2', 4), idxs[2].arg
+    assert (idxs[0].arg, idxs[0].src[0].val) == ('gidx0', 6), idxs[0]
+    assert (idxs[1].arg, idxs[1].src[0].val) == ('gidx1', 5), idxs[1].arg
+    assert (idxs[2].arg, idxs[2].src[0].val) == ('gidx2', 4), idxs[2].arg
 
   def test_sum_collapse(self):
     t = Tensor([2]).reshape(1, 1).expand(256, 256).sum()
@@ -290,7 +291,7 @@ class TestLinearizer(unittest.TestCase):
   @unittest.skipIf(MOCKGPU and isinstance(Device[Device.DEFAULT].renderer, (PTXRenderer, CUDARenderer)), "PTX indexes differently. might be ok?")
   def test_where_fold(self):
     a = Tensor.ones(4, 4).contiguous().realize()
-    b = a.shrink(((1, 2), None)).pad(((1, 2), None))
+    b = a.shrink(((1, 2), None)).pad(((1, 2), None)).bool()
     a.assign(b.where(2, a))
     linear, var_vals = a.linear_with_vars()
     assert len(linear.src) == 1
@@ -391,6 +392,16 @@ class TestLinearizer(unittest.TestCase):
 
     # the global store doesn't change
     assert stores[1].src[1].dtype == dtypes.float
+
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
+  def test_two_grouped_stores_local(self):
+    # GROUP on both reduces puts two LOCAL buffers in one kernel, and the store to each needs its own barrier
+    a = Tensor.rand(32, 32).realize()
+    opts = [Opt(OptOps.GROUP, 1, 4), Opt(OptOps.GROUP, 2, 4)]
+    ast = helper_linearizer_opt(single_kernel_softmax(a), [opts])
+    uops = to_program(replace_opts(ast, opts), renderer=Device[Device.DEFAULT].renderer).src[1].src
+    self.assertEqual(len([u for u in uops if u.op is Ops.BARRIER]), 2)
 
 # *** helpers ***
 
