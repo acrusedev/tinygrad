@@ -66,21 +66,22 @@ class DType(metaclass=DTypeMetaClass):
   def __reduce__(self): return type(self), tuple(getattr(self, f.name) for f in fields(self))
   def __repr__(self): return f"dtypes.{INVERSE_DTYPES_DICT[self.name]}"
   def __lt__(self, o:DType): return (self.priority, self.bitsize, self.name, self.fmt) < (o.priority, o.bitsize, o.name, o.fmt)
-  def scalar(self) -> DType: return self
   @functools.cached_property
   def min(self):
     if dtypes.is_int(self): return 0 if dtypes.is_unsigned(self) else -2**(self.bitsize-1)
-    return -float("inf") if dtypes.is_float(self) else False
+    return -self.max if dtypes.is_float(self) else False
   @functools.cached_property
   def max(self):
     if dtypes.is_int(self): return 2**(self.bitsize)-1+self.min
+    # e4m3 and the fnuz fp8s have no inf: their largest value is the largest normal
+    if self in dtypes.fp8s and self is not dtypes.fp8e5m2: return fp8_to_float(_fp8_cfg[self][5], self)
     return float("inf") if dtypes.is_float(self) else True
   def const(self, val: ConstType):
     if isinstance(val, InvalidType): return val
     # NOTE: float('nan') != float('nan'), so we canonicalize here
     if isinstance(val, float) and math.isnan(val): val = math.nan
     # int is the default. wrap floats in ConstFloat to distinguish -0.0 from 0.0 in cache
-    return ConstFloat(float(val)) if dtypes.is_float(self) else bool(val) if dtypes.is_bool(self) else int(val)
+    return ConstFloat(truncate.get(self, float)(float(val))) if dtypes.is_float(self) else bool(val) if dtypes.is_bool(self) else int(val)
 
 
 class DTypes:
@@ -102,7 +103,11 @@ class DTypes:
     if isinstance(x, float): return dtypes.weakfloat
     if isinstance(x, int): return dtypes.weakint
     # put this in the last is faster because there are more items than lists/tuples to check
-    if isinstance(x, (list, tuple)): return strong_dtype(max(dtypes.from_py(xi) for xi in x)) if x else dtypes.default_float
+    if isinstance(x, (list, tuple)):
+      dt = max(dtypes.from_py(xi) for xi in x) if x else dtypes.weakfloat
+      if dt is not dtypes.weakint: return strong_dtype(dt)
+      ints = [xi for xi in x if isinstance(xi, int)]  # a vconst also holds Invalid
+      return commit_int(min(ints), max(ints))
     raise RuntimeError(f"Could not infer dtype of {x} with type {type(x)}")
   @staticmethod
   def finfo(dtype:DType) -> tuple[int, int]:
@@ -121,8 +126,6 @@ class DTypes:
   uint32: Final[DType] = DType.new(6, 32, "unsigned int", 'I')
   int64: Final[DType] = DType.new(7, 64, "long", 'q')
   uint64: Final[DType] = DType.new(8, 64, "unsigned long", 'Q')
-  _uint128: Final[DType] = DType.new(8, 128, "uint128", None)
-  _uint256: Final[DType] = DType.new(8, 256, "uint256", None)
   weakfloat: Final[DType] = DType.new(9, 800, "weakfloat", None)
   fp8e4m3: Final[DType] = DType.new(10, 8, "float8_e4m3", None)
   fp8e5m2: Final[DType] = DType.new(11, 8, "float8_e5m2", None)
@@ -165,6 +168,10 @@ assert dtypes.is_float(dtypes.default_float), f"{DEFAULT_FLOAT.value} is not a f
 assert dtypes.is_int(dtypes.default_int), f"{DEFAULT_INT.value} is not an int dtype"
 def strong_dtype(dtype:DType) -> DType:
   return {dtypes.weakint: dtypes.default_int, dtypes.weakfloat: dtypes.default_float}.get(dtype, dtype)
+def commit_int(lo:int|float, hi:int|float, default_int:DType|None=None) -> DType:
+  if lo == hi and not dtypes.long.min <= lo <= dtypes.ulong.max: raise OverflowError(f"{lo} does not fit any int")
+  ladder = (dtypes.default_int if default_int is None else default_int, dtypes.int, dtypes.long, dtypes.ulong)
+  return next((dt for dt in ladder if dt.min <= lo and hi <= dt.max), dtypes.long)
 def weak_dtype(dtype:DType) -> DType:
   return dtypes.weakfloat if dtypes.is_float(dtype) else dtypes.weakint if dtypes.is_int(dtype) else dtype
 
@@ -222,7 +229,7 @@ def float_to_fp16(x):
 
 def float_to_bf16(x):
   if not math.isfinite(x): return x
-  u = struct.unpack('I', struct.pack('f', x))[0]
+  u = struct.unpack('I', struct.pack('f', truncate[dtypes.float](x)))[0]
   u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
   return struct.unpack('f', struct.pack('I', u))[0]
 
